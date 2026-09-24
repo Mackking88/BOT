@@ -88,7 +88,7 @@ def make_features(df):
     f["rsi"] = df.rsi
     f["atr_pct"] = df.atr / c
     f["vol_ratio"] = f.atr_pct / f.atr_pct.rolling(50).mean()
-    f["hist"] = df.hist / c
+    f["hist"] = df["hist"] / c
     f["pctb"] = df.pctb
     f["pos20"] = df.pos20
     f["body"] = (c - df.Open) / (df.High - df.Low + 1e-9)
@@ -138,7 +138,7 @@ def build_signals(df, p, buy_th, sell_th):
     df["p"] = p
     trend = np.tanh((df.ema_f - df.ema_s) / (df.atr + 1e-9))
     mom = (0.6 * ((df.rsi - 50) / 25).clip(-1, 1)
-           + 0.4 * np.tanh(df.hist / (df.atr + 1e-9) * 3))
+           + 0.4 * np.tanh(df["hist"] / (df.atr + 1e-9) * 3))
     struct = ((df.pos20 - 0.5) * 2).clip(-1, 1)
     ml = ((df.p - 0.5) * 6).clip(-1, 1).fillna(0)
     x = (0.30 * trend + 0.20 * mom + 0.15 * struct + 0.35 * ml).clip(-1, 1)

@@ -178,12 +178,21 @@ df["bb_pos"] = (df["Close"] - df["BB_dn"]) / (df["BB_up"] - df["BB_dn"] + 1e-9)
 df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
 
 # MTF trend merge
-if cfg["use_mtf"]:
-    htf_raw["Datetime"] = pd.to_datetime(htf_raw["Datetime"])
-    df["Datetime"] = pd.to_datetime(df["Datetime"])
-    df = pd.merge_asof(df.sort_values("Datetime"), htf_raw[["Datetime","trend_up"]].sort_values("Datetime"),
-                        on="Datetime", direction="backward")
-    df["trend_up"] = df["trend_up"].astype(float)
+# MTF trend merge
+if cfg["use_mtf"] and not htf_raw.empty:
+    htf = htf_raw.copy()
+    htf["Datetime"] = pd.to_datetime(htf["Datetime"], utc=True).dt.tz_localize(None)
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
+
+    df = df.sort_values("Datetime")
+    htf = htf[["Datetime", "trend_up"]].dropna().sort_values("Datetime")
+
+    if len(htf) > 0:
+        df = pd.merge_asof(df, htf, on="Datetime", direction="backward")
+    else:
+        df["trend_up"] = np.nan
+
+    df["trend_up"] = df["trend_up"].fillna(0.5).astype(float)
 else:
     df["trend_up"] = 0.5
 

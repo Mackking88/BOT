@@ -1,300 +1,301 @@
+# app.py — Advanced AI Index Dashboard v2
+# Multi-timeframe confirmation | Ensemble ML | 1000+ candles | Persistent settings
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import json, os
+from datetime import datetime, time
+import pytz
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.model_selection import TimeSeriesSplit
 from streamlit_autorefresh import st_autorefresh
-from sklearn.ensemble import RandomForestClassifier
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
-st.set_page_config(layout="wide", page_title="AI Signal Pro",
-                   initial_sidebar_state="collapsed")
+st.set_page_config(page_title="AI Pro Dashboard", layout="wide", initial_sidebar_state="expanded")
 
-IST = ZoneInfo("Asia/Kolkata")
-SYMBOLS = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK"}
-TF = {"5m": ("5m", "60d"), "15m": ("15m", "60d"),
-      "1h": ("60m", "1y"), "1D": ("1d", "5y")}
+CONFIG_FILE = "settings.json"
+IST = pytz.timezone("Asia/Kolkata")
 
-now = datetime.now(IST)
-hm = (now.hour, now.minute)
-market_open = now.weekday() < 5 and (9, 15) <= hm <= (15, 30)
+# ---------------- PERSISTENT SETTINGS ----------------
+DEFAULTS = {
+    "index": "NIFTY 50", "timeframe": "15m", "candles": 1000,
+    "fast_ema": 12, "slow_ema": 26, "buy_score": 78, "sell_score": 22,
+    "sl_atr": 1.5, "target_atr": 2.5, "cost_pct": 0.03, "auto_refresh": True,
+    "use_mtf": True, "mtf_interval": "1h", "min_folds_acc": 3
+}
+
+def load_settings():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            saved = json.load(f)
+        return {**DEFAULTS, **saved}
+    return DEFAULTS.copy()
+
+def save_settings(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+if "cfg" not in st.session_state:
+    st.session_state.cfg = load_settings()
+cfg = st.session_state.cfg
+
+def upd(key):
+    def _cb():
+        cfg[key] = st.session_state[f"w_{key}"]
+        save_settings(cfg)
+    return _cb
+
+SYMBOL_MAP = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "SENSEX": "^BSESN", "FINNIFTY": "^CNXFIN"}
 
 with st.sidebar:
-    st.header("Settings")
-    name = st.selectbox("Index", list(SYMBOLS))
-    tf = st.selectbox("Timeframe", list(TF), index=1)
-    bars = st.slider("Candles dikhao", 50, 400, 150, step=10)
-    fast = st.number_input("Fast EMA", 3, 50, 9)
-    slow = st.number_input("Slow EMA", 10, 200, 21)
-    buy_th = st.slider("Buy score >=", 55, 85, 62)
-    sell_th = 100 - buy_th
-    st.caption(f"Sell score <= {sell_th}")
-    sl_mult = st.number_input("Stop Loss (x ATR)", 0.5, 5.0, 1.5, step=0.1)
-    tg_mult = st.number_input("Target (x ATR)", 0.5, 8.0, 2.5, step=0.1)
-    cost = st.number_input("Cost per trade (%)", 0.0, 1.0, 0.03, step=0.01)
-    auto = st.toggle("Auto refresh (30s)", value=True)
+    st.header("⚙️ Settings")
+    st.selectbox("Index", list(SYMBOL_MAP.keys()),
+                 index=list(SYMBOL_MAP.keys()).index(cfg["index"]),
+                 key="w_index", on_change=upd("index"))
+    st.selectbox("Timeframe", ["5m","15m","1h","1d"],
+                 index=["5m","15m","1h","1d"].index(cfg["timeframe"]),
+                 key="w_timeframe", on_change=upd("timeframe"))
+    st.slider("Candles", 300, 2000, cfg["candles"], step=100, key="w_candles", on_change=upd("candles"))
 
-if auto and market_open:
-    st_autorefresh(interval=30000, key="refresh")
+    st.subheader("Multi-Timeframe Filter")
+    st.checkbox("Use higher-TF trend confirmation", cfg["use_mtf"], key="w_use_mtf", on_change=upd("use_mtf"))
+    st.selectbox("Higher TF", ["1h","1d"],
+                 index=["1h","1d"].index(cfg["mtf_interval"]),
+                 key="w_mtf_interval", on_change=upd("mtf_interval"))
 
-@st.cache_data(ttl=20)
-def get_data(sym, interval, period):
-    df = yf.download(sym, period=period, interval=interval,
-                     progress=False, auto_adjust=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.dropna()
-    if len(df) == 0:
-        return df
-    idx = df.index
-    if idx.tz is not None:
-        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
-    df.index = idx
+    st.subheader("Indicators")
+    st.number_input("Fast EMA", 3, 50, cfg["fast_ema"], key="w_fast_ema", on_change=upd("fast_ema"))
+    st.number_input("Slow EMA", 5, 100, cfg["slow_ema"], key="w_slow_ema", on_change=upd("slow_ema"))
+
+    st.subheader("Signal Thresholds")
+    st.slider("Buy score ≥", 50, 95, cfg["buy_score"], key="w_buy_score", on_change=upd("buy_score"))
+    st.slider("Sell score ≤", 5, 50, cfg["sell_score"], key="w_sell_score", on_change=upd("sell_score"))
+
+    st.subheader("Risk Management")
+    st.number_input("Stop Loss (x ATR)", 0.5, 5.0, cfg["sl_atr"], step=0.1, key="w_sl_atr", on_change=upd("sl_atr"))
+    st.number_input("Target (x ATR)", 0.5, 5.0, cfg["target_atr"], step=0.1, key="w_target_atr", on_change=upd("target_atr"))
+
+    st.checkbox("Auto refresh (30s live)", cfg["auto_refresh"], key="w_auto_refresh", on_change=upd("auto_refresh"))
+
+# ---------------- MARKET STATUS ----------------
+def market_open():
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return time(9,15) <= now.time() <= time(15,30)
+
+is_open = market_open()
+if cfg["auto_refresh"] and is_open:
+    st_autorefresh(interval=30_000, key="refresh")
+
+# ---------------- DATA ----------------
+@st.cache_data(ttl=25)
+def fetch_data(symbol, interval, period):
+    df = yf.download(symbol, interval=interval, period=period, progress=False)
+    df = df.reset_index()
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     return df
 
-def rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    return 100 - 100 / (1 + up / dn)
+period_map = {"5m":"60d","15m":"60d","1h":"2y","1d":"5y"}
+symbol = SYMBOL_MAP[cfg["index"]]
+raw = fetch_data(symbol, cfg["timeframe"], period_map[cfg["timeframe"]])
+df = raw.tail(cfg["candles"]).reset_index(drop=True)
 
-def indicators(df, fast, slow):
-    df = df.copy()
-    c, h, l, o = df.Close, df.High, df.Low, df.Open
-    df["ema_f"] = c.ewm(span=fast, adjust=False).mean()
-    df["ema_s"] = c.ewm(span=slow, adjust=False).mean()
-    df["rsi"] = rsi(c)
-    tr = pd.concat([h - l, (h - c.shift()).abs(),
-                    (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
-    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    df["hist"] = macd - macd.ewm(span=9, adjust=False).mean()
-    ma20, sd20 = c.rolling(20).mean(), c.rolling(20).std()
-    df["pctb"] = (c - (ma20 - 2 * sd20)) / (4 * sd20 + 1e-9)
-    df["hi20"] = h.rolling(20).max()
-    df["lo20"] = l.rolling(20).min()
-    df["pos20"] = (c - df.lo20) / (df.hi20 - df.lo20 + 1e-9)
-    return df
+if cfg["use_mtf"]:
+    htf_raw = fetch_data(symbol, cfg["mtf_interval"], period_map[cfg["mtf_interval"]])
+    htf_raw["EMA_htf"] = htf_raw["Close"].ewm(span=21).mean()
+    htf_raw["trend_up"] = htf_raw["Close"] > htf_raw["EMA_htf"]
 
-def make_features(df):
-    c = df.Close
-    f = pd.DataFrame(index=df.index)
-    for n in (1, 3, 5, 10):
-        f[f"r{n}"] = c.pct_change(n)
-    f["ema_dist"] = c / df.ema_f - 1
-    f["ema_gap"] = df.ema_f / df.ema_s - 1
-    f["rsi"] = df.rsi
-    f["atr_pct"] = df.atr / c
-    f["vol_ratio"] = f.atr_pct / f.atr_pct.rolling(50).mean()
-    f["hist"] = df["hist"] / c
-    f["pctb"] = df.pctb
-    f["pos20"] = df.pos20
-    f["body"] = (c - df.Open) / (df.High - df.Low + 1e-9)
-    if df.index.to_series().diff().median() < pd.Timedelta(days=1):
-        f["hour"] = df.index.hour + df.index.minute / 60
-    return f.replace([np.inf, -np.inf], np.nan)
+# ---------------- FEATURE ENGINEERING ----------------
+def rsi(series, period=14):
+    d = series.diff()
+    gain = d.clip(lower=0).rolling(period).mean()
+    loss = -d.clip(upper=0).rolling(period).mean()
+    return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-@st.cache_data(show_spinner="AI model train ho raha hai...")
-def run_ml(_df, key):
-    X = make_features(_df)
-    y = (_df.Close.shift(-1) > _df.Close).astype(int)
-    lab = X.iloc[:-1].dropna()
-    yl = y.loc[lab.index]
-    n = len(lab)
-    out = {"ok": False}
-    if n < 250:
-        return out
-    mk = lambda: RandomForestClassifier(
-        n_estimators=150, max_depth=5, min_samples_leaf=25,
-        n_jobs=-1, random_state=0)
-    proba = pd.Series(np.nan, index=X.index)
-    start = int(n * 0.5)
-    edges = np.linspace(start, n, 6).astype(int)
-    for i in range(5):
-        m = mk().fit(lab.iloc[:edges[i]], yl.iloc[:edges[i]])
-        te = lab.iloc[edges[i]:edges[i + 1]]
-        if len(te):
-            proba.loc[te.index] = m.predict_proba(te)[:, 1]
-    final = mk().fit(lab, yl)
-    if not X.iloc[[-1]].isna().any(axis=1).iloc[0]:
-        proba.iloc[-1] = final.predict_proba(X.iloc[[-1]])[:, 1][0]
-    oos = proba.iloc[:-1].dropna()
-    yt = yl.loc[oos.index]
-    pred = (oos > 0.5).astype(int)
-    acc = (pred == yt).mean() * 100
-    base = max(yt.mean(), 1 - yt.mean()) * 100
-    hc = (oos > 0.55) | (oos < 0.45)
-    hc_acc = (pred[hc] == yt[hc]).mean() * 100 if hc.sum() else float("nan")
-    imp = pd.Series(final.feature_importances_, index=lab.columns)
-    imp = imp.sort_values(ascending=False).head(5)
-    return {"ok": True, "proba": proba, "oos_start": oos.index[0],
-            "acc": acc, "base": base, "hc_acc": hc_acc,
-            "hc_n": int(hc.sum()), "n_oos": len(oos), "imp": imp}
+def atr(df, period=14):
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"] - df["Close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-def build_signals(df, p, buy_th, sell_th):
-    df = df.copy()
-    df["p"] = p
-    trend = np.tanh((df.ema_f - df.ema_s) / (df.atr + 1e-9))
-    mom = (0.6 * ((df.rsi - 50) / 25).clip(-1, 1)
-           + 0.4 * np.tanh(df["hist"] / (df.atr + 1e-9) * 3))
-    struct = ((df.pos20 - 0.5) * 2).clip(-1, 1)
-    ml = ((df.p - 0.5) * 6).clip(-1, 1).fillna(0)
-    x = (0.30 * trend + 0.20 * mom + 0.15 * struct + 0.35 * ml).clip(-1, 1)
-    df["score"] = 50 + 50 * x
-    raw = pd.Series(np.nan, index=df.index)
-    raw[(df.score - 50).abs() < 5] = 0
-    raw[(df.score >= buy_th) & (df.p > 0.5)] = 1
-    raw[(df.score <= sell_th) & (df.p < 0.5)] = -1
-    df["pos"] = raw.ffill().fillna(0)
-    df["signal"] = df.pos.diff().fillna(0)
-    return df
+def macd(series, fast=12, slow=26, signal=9):
+    ema_f, ema_s = series.ewm(span=fast).mean(), series.ewm(span=slow).mean()
+    macd_line = ema_f - ema_s
+    signal_line = macd_line.ewm(span=signal).mean()
+    return macd_line, signal_line, macd_line - signal_line
 
-def backtest(d, cost_pct):
-    ret = d.Close.pct_change().fillna(0)
-    chg = d.pos.diff().abs().fillna(0)
-    strat = d.pos.shift(1).fillna(0) * ret - chg * cost_pct / 100
-    eq = (1 + strat).cumprod()
-    dd = eq / eq.cummax() - 1
-    seg = (d.pos != d.pos.shift()).cumsum()
-    tr = strat.groupby(seg).sum()
-    active = d.pos.groupby(seg).first() != 0
-    return eq, dd, tr[active]
+def adx(df, period=14):
+    up = df["High"].diff()
+    down = -df["Low"].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = atr(df, period)
+    plus_di = 100 * pd.Series(plus_dm).rolling(period).mean() / tr
+    minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / tr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.rolling(period).mean()
 
-interval, period = TF[tf]
-raw_df = get_data(SYMBOLS[name], interval, period)
-if len(raw_df) < 300:
-    st.error("Data kam hai ya nahi mila. Alag timeframe try karo.")
-    st.stop()
+def stochastic(df, k=14, d=3):
+    low_min = df["Low"].rolling(k).min()
+    high_max = df["High"].rolling(k).max()
+    pct_k = 100 * (df["Close"] - low_min) / (high_max - low_min)
+    return pct_k, pct_k.rolling(d).mean()
 
-base = indicators(raw_df, fast, slow)
-ml = run_ml(base, f"{name}-{tf}-{fast}-{slow}-{raw_df.index[-1]}")
-if not ml["ok"]:
-    st.error("AI ke liye data kam hai. 15m ya 1D timeframe try karo.")
-    st.stop()
+def vwap(df):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    return (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
 
-df = build_signals(base, ml["proba"], buy_th, sell_th)
-bt = df.loc[ml["oos_start"]:]
-eq, dd, tr = backtest(bt, cost)
-bh = (bt.Close / bt.Close.iloc[0] - 1) * 100
+df["EMA_fast"] = df["Close"].ewm(span=cfg["fast_ema"]).mean()
+df["EMA_slow"] = df["Close"].ewm(span=cfg["slow_ema"]).mean()
+df["EMA200"] = df["Close"].ewm(span=200).mean()
+df["RSI"] = rsi(df["Close"])
+df["ATR"] = atr(df)
+df["MACD"], df["MACD_signal"], df["MACD_hist"] = macd(df["Close"])
+df["ADX"] = adx(df)
+df["Stoch_K"], df["Stoch_D"] = stochastic(df)
+df["VWAP"] = vwap(df)
+df["BB_mid"] = df["Close"].rolling(20).mean()
+df["BB_std"] = df["Close"].rolling(20).std()
+df["BB_up"] = df["BB_mid"] + 2*df["BB_std"]
+df["BB_dn"] = df["BB_mid"] - 2*df["BB_std"]
 
-last, prev = df.iloc[-1], df.iloc[-2]
-chg = (last.Close / prev.Close - 1) * 100
-px_col = "#26a69a" if chg >= 0 else "#ef5350"
-state = {1: "BUY", -1: "SELL", 0: "WAIT"}[int(last.pos)]
-s_col = {"BUY": "#00e676", "SELL": "#ff1744", "WAIT": "#9aa0a6"}[state]
-status = "🟢 MARKET OPEN" if market_open else "🔴 MARKET CLOSED"
-p_up = last.p * 100 if pd.notna(last.p) else float("nan")
+df["r1"] = df["Close"].pct_change(1)
+df["r3"] = df["Close"].pct_change(3)
+df["r5"] = df["Close"].pct_change(5)
+df["r10"] = df["Close"].pct_change(10)
+df["r20"] = df["Close"].pct_change(20)
+df["vol_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
+df["ema_diff"] = (df["EMA_fast"] - df["EMA_slow"]) / df["Close"]
+df["dist_vwap"] = (df["Close"] - df["VWAP"]) / df["Close"]
+df["dist_ema200"] = (df["Close"] - df["EMA200"]) / df["Close"]
+df["bb_pos"] = (df["Close"] - df["BB_dn"]) / (df["BB_up"] - df["BB_dn"] + 1e-9)
+df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
 
-if state == "BUY":
-    sl, tg = last.Close - sl_mult * last.atr, last.Close + tg_mult * last.atr
-elif state == "SELL":
-    sl, tg = last.Close + sl_mult * last.atr, last.Close - tg_mult * last.atr
+# MTF trend merge
+if cfg["use_mtf"]:
+    htf_raw["Datetime"] = pd.to_datetime(htf_raw["Datetime"])
+    df["Datetime"] = pd.to_datetime(df["Datetime"])
+    df = pd.merge_asof(df.sort_values("Datetime"), htf_raw[["Datetime","trend_up"]].sort_values("Datetime"),
+                        on="Datetime", direction="backward")
+    df["trend_up"] = df["trend_up"].astype(float)
 else:
-    sl = tg = None
+    df["trend_up"] = 0.5
 
-st.markdown(f"""
-<div style="display:flex;flex-wrap:wrap;gap:22px;align-items:flex-end;">
-  <div><div style="opacity:.6;font-size:13px">{name} · {status}</div>
-  <div style="font-size:32px;font-weight:700;color:{px_col}">{last.Close:,.2f}
-  <span style="font-size:16px">({chg:+.2f}%)</span></div></div>
-  <div><div style="opacity:.6;font-size:13px">AI SIGNAL</div>
-  <div style="font-size:30px;font-weight:800;color:{s_col}">{state}</div></div>
-  <div><div style="opacity:.6;font-size:13px">Score (0-100)</div>
-  <div style="font-size:26px;font-weight:700">{last.score:.0f}</div></div>
-  <div><div style="opacity:.6;font-size:13px">AI: agli candle UP</div>
-  <div style="font-size:26px;font-weight:700">{p_up:.0f}%</div></div>
-  {"" if sl is None else f'''<div><div style="opacity:.6;font-size:13px">Stop Loss / Target</div>
-  <div style="font-size:20px;font-weight:700"><span style="color:#ff1744">{sl:,.0f}</span> / <span style="color:#00e676">{tg:,.0f}</span></div></div>'''}
-</div>
-""", unsafe_allow_html=True)
+df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
 
-st.write("")
-wins, losses = tr[tr > 0], tr[tr < 0]
-win_rate = len(wins) / len(tr) * 100 if len(tr) else 0
-pf = wins.sum() / abs(losses.sum()) if len(losses) and losses.sum() != 0 else float("nan")
+FEATURES = ["r1","r3","r5","r10","r20","RSI","ema_diff","vol_ratio","MACD_hist",
+            "ADX","Stoch_K","dist_vwap","dist_ema200","bb_pos","hl_range","trend_up"]
+data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("AI accuracy (unseen data)", f"{ml['acc']:.1f}%",
-          f"{ml['acc'] - ml['base']:+.1f}% vs baseline")
-c2.metric("Strong-signal accuracy", f"{ml['hc_acc']:.1f}%",
-          f"{ml['hc_n']} signals")
-c3.metric("Strategy vs Buy&Hold",
-          f"{(eq.iloc[-1] - 1) * 100:+.2f}%", f"B&H {bh.iloc[-1]:+.2f}%")
-c4.metric("Trades / Win% / PF", f"{len(tr)} / {win_rate:.0f}% / {pf:.2f}")
+# ---------------- WALK-FORWARD VALIDATION (multiple folds) ----------------
+n_folds = max(cfg["min_folds_acc"], 3)
+tscv = TimeSeriesSplit(n_splits=n_folds)
+fold_accs = []
 
-edge = ml["acc"] - ml["base"]
-if edge >= 2 and ml["hc_n"] >= 30:
-    st.success("AI ko unseen data pe halka edge mila. Phir bhi paper trading karo.")
+for train_idx, test_idx in tscv.split(data):
+    tr, te = data.iloc[train_idx], data.iloc[test_idx]
+    m = VotingClassifier([
+        ("gb", GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.05)),
+        ("rf", RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42))
+    ], voting="soft")
+    m.fit(tr[FEATURES], tr["target"])
+    fold_accs.append((m.predict(te[FEATURES]) == te["target"]).mean())
+
+avg_acc = np.mean(fold_accs)
+std_acc = np.std(fold_accs)
+
+# Final model trained on all data for live signal
+final_model = VotingClassifier([
+    ("gb", GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.05)),
+    ("rf", RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42))
+], voting="soft")
+final_model.fit(data[FEATURES], data["target"])
+
+# feature importance from GB estimator
+gb_est = final_model.estimators_[0]
+importances = pd.Series(gb_est.feature_importances_, index=FEATURES).sort_values(ascending=False)
+
+df["ai_prob"] = np.nan
+valid_idx = df.dropna(subset=FEATURES).index
+df.loc[valid_idx, "ai_prob"] = final_model.predict_proba(df.loc[valid_idx, FEATURES])[:,1]
+df["score"] = (df["ai_prob"] * 100).round(0)
+
+latest = df.iloc[-1]
+if latest["score"] >= cfg["buy_score"]:
+    signal = "BUY"
+elif latest["score"] <= cfg["sell_score"]:
+    signal = "SELL"
 else:
-    st.warning("AI ko abhi koi pakka edge nahi mila (baseline ke kareeb). "
-               "Is signal pe akele bharosa mat karo. Timeframe/settings badal ke test karo.")
+    signal = "HOLD"
 
-view = df.tail(bars)
-eqv = eq.reindex(view.index)
-bhv = (1 + bh / 100).reindex(view.index)
+sl = latest["Close"] - cfg["sl_atr"]*latest["ATR"] if signal=="BUY" else latest["Close"] + cfg["sl_atr"]*latest["ATR"]
+target = latest["Close"] + cfg["target_atr"]*latest["ATR"] if signal=="BUY" else latest["Close"] - cfg["target_atr"]*latest["ATR"]
 
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                    row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.02)
+# ---------------- HEADER ----------------
+c1,c2,c3,c4,c5 = st.columns(5)
+c1.metric(cfg["index"], f"{latest['Close']:.2f}", f"{df['Close'].pct_change().iloc[-1]*100:.2f}%")
+c2.metric("AI Signal", signal)
+c3.metric("Score (0-100)", f"{latest['score']:.0f}")
+c4.metric(f"Walk-fwd Acc ({n_folds} folds)", f"{avg_acc*100:.1f}% ±{std_acc*100:.1f}")
+c5.metric("HTF Trend", "UP" if latest["trend_up"]==1 else "DOWN")
+
+st.caption(f"{'🟢 MARKET OPEN' if is_open else '🔴 MARKET CLOSED'} | SL: {sl:.1f} | Target: {target:.1f} | "
+           f"Candles: {len(df)} | Model: GB+RF Ensemble")
+
+if avg_acc < 0.55:
+    st.warning(f"Walk-forward accuracy {avg_acc*100:.1f}% hai — variance ±{std_acc*100:.1f}% ke saath. "
+               f"Isse pata chalta hai model abhi consistently edge nahi de raha. Feature/timeframe adjust kar ke retest karo.")
+
+with st.expander("📊 Feature Importance (AI ne kin cheezon pe dhyan diya)"):
+    st.bar_chart(importances.head(10))
+
+# ---------------- PROFESSIONAL CHART ----------------
+fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5,0.15,0.15,0.2],
+                     vertical_spacing=0.02)
+
 fig.add_trace(go.Candlestick(
-    x=view.index, open=view.Open, high=view.High, low=view.Low, close=view.Close,
-    increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-    increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
-    name="Price", showlegend=False), row=1, col=1)
-fig.add_trace(go.Scatter(x=view.index, y=view.ema_f, name=f"EMA {fast}",
-              line=dict(color="#f5a623", width=1.3)), row=1, col=1)
-fig.add_trace(go.Scatter(x=view.index, y=view.ema_s, name=f"EMA {slow}",
-              line=dict(color="#4fc3f7", width=1.3)), row=1, col=1)
-fig.add_trace(go.Scatter(x=view.index, y=view.hi20, name="Resistance",
-              line=dict(color="rgba(239,83,80,.5)", width=1, dash="dot")), row=1, col=1)
-fig.add_trace(go.Scatter(x=view.index, y=view.lo20, name="Support",
-              line=dict(color="rgba(38,166,154,.5)", width=1, dash="dot")), row=1, col=1)
-buys, sells = view[view.signal > 0], view[view.signal < 0]
-fig.add_trace(go.Scatter(x=buys.index, y=buys.Low * 0.9993, mode="markers",
-              marker=dict(symbol="triangle-up", size=13, color="#00e676",
-                          line=dict(width=1, color="white")), name="Buy"), row=1, col=1)
-fig.add_trace(go.Scatter(x=sells.index, y=sells.High * 1.0007, mode="markers",
-              marker=dict(symbol="triangle-down", size=13, color="#ff1744",
-                          line=dict(width=1, color="white")), name="Sell"), row=1, col=1)
-fig.add_hline(y=float(last.Close), line_dash="dot", line_color=px_col,
-              line_width=1, row=1, col=1)
-if sl is not None:
-    fig.add_hline(y=float(sl), line_color="#ff1744", line_width=1, row=1, col=1)
-    fig.add_hline(y=float(tg), line_color="#00e676", line_width=1, row=1, col=1)
+    x=df["Datetime"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+    name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
+), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_fast"], name=f"EMA{cfg['fast_ema']}", line=dict(color="orange", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_slow"], name=f"EMA{cfg['slow_ema']}", line=dict(color="cyan", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA200"], name="EMA200", line=dict(color="white", width=1, dash="dash")), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(color="yellow", width=1)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_up"], line=dict(color="gray", width=0.5, dash="dot"), name="BB Up"), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_dn"], line=dict(color="gray", width=0.5, dash="dot"), name="BB Dn"), row=1, col=1)
 
-fig.add_trace(go.Scatter(x=view.index, y=view.score, name="Score",
-              line=dict(color="#ab47bc", width=1.4), showlegend=False), row=2, col=1)
-for lvl in (sell_th, 50, buy_th):
-    fig.add_hline(y=lvl, line_dash="dot", line_color="gray",
-                  line_width=0.6, row=2, col=1)
-fig.add_trace(go.Scatter(x=eqv.index, y=eqv, name="Strategy",
-              line=dict(color="#66bb6a", width=1.5)), row=3, col=1)
-fig.add_trace(go.Scatter(x=bhv.index, y=bhv, name="Buy&Hold",
-              line=dict(color="#9aa0a6", width=1, dash="dot")), row=3, col=1)
+buys = df[df["score"] >= cfg["buy_score"]]
+sells = df[df["score"] <= cfg["sell_score"]]
+fig.add_trace(go.Scatter(x=buys["Datetime"], y=buys["Low"]*0.997, mode="markers",
+              marker=dict(symbol="triangle-up", color="lime", size=11), name="Buy"), row=1, col=1)
+fig.add_trace(go.Scatter(x=sells["Datetime"], y=sells["High"]*1.003, mode="markers",
+              marker=dict(symbol="triangle-down", color="red", size=11), name="Sell"), row=1, col=1)
 
-breaks = [dict(bounds=["sat", "mon"])]
-if tf != "1D":
-    breaks.append(dict(bounds=[15.5, 9.25], pattern="hour"))
-fig.update_xaxes(rangebreaks=breaks, rangeslider_visible=False,
-                 showspikes=True, spikemode="across", spikethickness=1,
-                 spikecolor="#888", showgrid=False)
-fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)", side="right")
-fig.update_yaxes(range=[0, 100], row=2, col=1)
-fig.update_layout(height=760, template="plotly_dark", dragmode="pan",
-                  hovermode="x unified", margin=dict(l=5, r=5, t=10, b=10),
-                  legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
-                  paper_bgcolor="#0e1117", plot_bgcolor="#0e1117")
-st.plotly_chart(fig, use_container_width=True, config={
-    "scrollZoom": True, "displaylogo": False,
-    "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"]})
+fig.add_trace(go.Bar(x=df["Datetime"], y=df["Volume"], name="Volume", marker_color="#555"), row=2, col=1)
 
-with st.expander("AI ne kin cheezon pe dhyan diya (top 5)"):
-    st.dataframe(ml["imp"].rename("importance").round(3), use_container_width=True)
-with st.expander("Last 10 signals"):
-    sg = df[df.signal != 0][["Close", "score", "signal"]].tail(10).copy()
-    sg["type"] = sg.signal.apply(lambda v: "BUY" if v > 0 else "SELL")
-    st.dataframe(sg[["Close", "score", "type"]].iloc[::-1], use_container_width=True)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="violet")), row=3, col=1)
+fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
+fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
 
-st.caption(f"Last update: {now.strftime('%d %b %H:%M:%S')} IST | Backtest sirf unseen "
-           f"({ml['n_oos']} candles) data pe | Data Yahoo (delayed) | Sirf paper testing.")
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD"], name="MACD", line=dict(color="cyan")), row=4, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD_signal"], name="Signal", line=dict(color="orange")), row=4, col=1)
+fig.add_trace(go.Bar(x=df["Datetime"], y=df["MACD_hist"], name="Histogram", marker_color="gray"), row=4, col=1)
+
+fig.update_layout(
+    template="plotly_dark", height=950, xaxis_rangeslider_visible=False,
+    dragmode="pan", margin=dict(l=10,r=10,t=30,b=10),
+    legend=dict(orientation="h", y=1.03), uirevision="keep"
+)
+# default zoom to last ~150 candles for readability, full history still scrollable
+fig.update_xaxes(range=[df["Datetime"].iloc[-150], df["Datetime"].iloc[-1]], row=1, col=1)
+
+st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+
+st.caption(f"Last update: {datetime.now(IST).strftime('%d %b %H:%M:%S IST')} | "
+           f"Folds: {n_folds} | Features: {len(FEATURES)} | Paper testing only.")

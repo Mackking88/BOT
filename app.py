@@ -194,18 +194,37 @@ FEATURES = ["r1","r3","r5","r10","r20","RSI","ema_diff","vol_ratio","MACD_hist",
 data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
 
 # ---------------- WALK-FORWARD VALIDATION (multiple folds) ----------------
-n_folds = max(cfg["min_folds_acc"], 3)
+n_samples = len(data)
+
+if n_samples < 50:
+    st.error(f"Sirf {n_samples} valid rows hain indicators/dropna ke baad — itna data ML training ke liye kaafi nahi hai. "
+             f"Timeframe change karo (1h ya 1d try karo) ya candles slider badhao.")
+    st.stop()
+
+max_possible_folds = max(1, (n_samples - 1) // 30)
+n_folds = min(cfg["min_folds_acc"], max_possible_folds)
+n_folds = max(n_folds, 2)
+
+if n_folds < cfg["min_folds_acc"]:
+    st.info(f"Data kam hone ki wajah se {n_folds} folds use ho rahe hain (requested: {cfg['min_folds_acc']}).")
+
 tscv = TimeSeriesSplit(n_splits=n_folds)
 fold_accs = []
 
 for train_idx, test_idx in tscv.split(data):
     tr, te = data.iloc[train_idx], data.iloc[test_idx]
+    if len(tr) < 20 or len(te) < 5:
+        continue
     m = VotingClassifier([
         ("gb", GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.05)),
         ("rf", RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42))
     ], voting="soft")
     m.fit(tr[FEATURES], tr["target"])
     fold_accs.append((m.predict(te[FEATURES]) == te["target"]).mean())
+
+if len(fold_accs) == 0:
+    st.error("Koi valid fold nahi ban paya — candles ya timeframe badlo.")
+    st.stop()
 
 avg_acc = np.mean(fold_accs)
 std_acc = np.std(fold_accs)

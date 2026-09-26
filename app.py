@@ -1,6 +1,4 @@
-# app.py — AI Index Dashboard (Final Consolidated Version)
-# Persistent settings | MTF confirmation | Ensemble ML | Data validation | Pro chart
-
+# app.py — AI Index Dashboard (Final Robust Version)
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -21,10 +19,10 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # ==================== PERSISTENT SETTINGS ====================
 DEFAULTS = {
-    "index": "NIFTY 50", "timeframe": "1h", "candles": 800,
+    "index": "NIFTY 50", "timeframe": "15m", "candles": 1000,
     "fast_ema": 12, "slow_ema": 26, "buy_score": 78, "sell_score": 22,
     "sl_atr": 1.5, "target_atr": 2.5, "cost_pct": 0.03, "auto_refresh": True,
-    "use_mtf": True, "mtf_interval": "1d", "min_folds_acc": 3
+    "use_mtf": True, "mtf_interval": "1h", "min_folds_acc": 3
 }
 
 def load_settings():
@@ -80,8 +78,8 @@ with st.sidebar:
 
     st.checkbox("Auto refresh (30s live)", cfg["auto_refresh"], key="w_auto_refresh", on_change=upd("auto_refresh"))
 
-    if cfg["timeframe"] in ["5m", "15m"] and cfg["candles"] > 600:
-        st.caption("⚠️ Intraday timeframes (5m/15m) ka yfinance history limited hota hai (~60 din). Itne candles na milein toh timeframe 1h/1d karo.")
+    if cfg["timeframe"] in ["5m", "15m"] and cfg["candles"] > 1400:
+        st.caption("⚠️ 5m/15m ka yfinance history ~60 din tak hi milta hai. Bahut zyada candles maangne pe automatically jitna available hoga utna hi milega.")
 
 # ==================== MARKET STATUS ====================
 def market_open():
@@ -94,41 +92,48 @@ is_open = market_open()
 if cfg["auto_refresh"] and is_open:
     st_autorefresh(interval=30_000, key="refresh")
 
-# ==================== DATA FETCH + VALIDATION ====================
+# ==================== DATA FETCH + VALIDATION (always returns tuple) ====================
 @st.cache_data(ttl=25)
 def fetch_data(symbol, interval, period):
     try:
-        df = yf.download(symbol, interval=interval, period=period, progress=False)
+        raw_df = yf.download(symbol, interval=interval, period=period, progress=False)
     except Exception:
-        return pd.DataFrame()
-    if df.empty:
-        return df
-    df = df.reset_index()
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    date_col = "Datetime" if "Datetime" in df.columns else "Date"
-    df = df.rename(columns={date_col: "Datetime"})
+        return pd.DataFrame(), 0
 
-    # --- candle quality / validation ---
-    before = len(df)
-    df = df.dropna(subset=["Open","High","Low","Close"])
-    df = df[(df["High"] >= df["Low"]) & (df["High"] >= df["Open"]) &
-            (df["High"] >= df["Close"]) & (df["Low"] <= df["Open"]) &
-            (df["Low"] <= df["Close"]) & (df["Volume"] >= 0)]
-    df = df.drop_duplicates(subset="Datetime").sort_values("Datetime").reset_index(drop=True)
-    dropped = before - len(df)
-    return df, dropped
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(), 0
+
+    d = raw_df.reset_index()
+    d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
+    date_col = "Datetime" if "Datetime" in d.columns else "Date"
+    d = d.rename(columns={date_col: "Datetime"})
+
+    required = ["Datetime","Open","High","Low","Close","Volume"]
+    for col in required:
+        if col not in d.columns:
+            return pd.DataFrame(), 0
+
+    before = len(d)
+    d = d.dropna(subset=["Open","High","Low","Close"])
+    if len(d) > 0:
+        d = d[(d["High"] >= d["Low"]) & (d["High"] >= d["Open"]) &
+              (d["High"] >= d["Close"]) & (d["Low"] <= d["Open"]) &
+              (d["Low"] <= d["Close"]) & (d["Volume"] >= 0)]
+    d = d.drop_duplicates(subset="Datetime").sort_values("Datetime").reset_index(drop=True)
+    dropped = before - len(d)
+    return d, dropped
 
 period_map = {"5m":"60d","15m":"60d","1h":"2y","1d":"5y"}
 symbol = SYMBOL_MAP[cfg["index"]]
 raw, dropped_main = fetch_data(symbol, cfg["timeframe"], period_map[cfg["timeframe"]])
 
 if raw.empty:
-    st.error("Data fetch fail hua — market band ho sakta hai ya yfinance temporarily unavailable hai. Thodi der baad retry karo.")
+    st.error("Data fetch fail hua — market band ho sakta hai ya yfinance temporarily unavailable hai. Thodi der baad retry karo, ya timeframe/index badal ke dekho.")
     st.stop()
 
 df = raw.tail(cfg["candles"]).reset_index(drop=True)
 
-htf_raw = pd.DataFrame()
+htf_raw, _ = (pd.DataFrame(), 0)
 if cfg["use_mtf"]:
     htf_raw, _ = fetch_data(symbol, cfg["mtf_interval"], period_map[cfg["mtf_interval"]])
 
@@ -174,6 +179,8 @@ def vwap(df):
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
     return (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
 
+df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
+
 df["EMA_fast"] = df["Close"].ewm(span=cfg["fast_ema"]).mean()
 df["EMA_slow"] = df["Close"].ewm(span=cfg["slow_ema"]).mean()
 df["EMA200"] = df["Close"].ewm(span=200).mean()
@@ -200,53 +207,61 @@ df["dist_ema200"] = (df["Close"] - df["EMA200"]) / df["Close"]
 df["bb_pos"] = (df["Close"] - df["BB_dn"]) / (df["BB_up"] - df["BB_dn"] + 1e-9)
 df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
 
-# ---- MTF trend merge (robust) ----
+# ---- MTF trend merge (fully safe — never produces all-NaN) ----
+mtf_status = "OFF"
 if cfg["use_mtf"] and not htf_raw.empty:
-    htf = htf_raw.copy()
-    htf["EMA_htf"] = htf["Close"].ewm(span=21).mean()
-    htf["trend_up"] = (htf["Close"] > htf["EMA_htf"]).astype(float)
+    try:
+        htf = htf_raw.copy()
+        htf["Datetime"] = pd.to_datetime(htf["Datetime"], utc=True).dt.tz_localize(None)
+        htf["EMA_htf"] = htf["Close"].ewm(span=21).mean()
+        htf["trend_up"] = (htf["Close"] > htf["EMA_htf"]).astype(float)
+        htf_small = htf[["Datetime","trend_up"]].dropna().sort_values("Datetime")
 
-    htf["Datetime"] = pd.to_datetime(htf["Datetime"], utc=True).dt.tz_localize(None)
-    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
-
-    df = df.sort_values("Datetime")
-    htf_small = htf[["Datetime", "trend_up"]].dropna().sort_values("Datetime")
-
-    if len(htf_small) > 0:
-        df = pd.merge_asof(df, htf_small, on="Datetime", direction="backward")
-    else:
+        if len(htf_small) > 0:
+            df = df.sort_values("Datetime")
+            df = pd.merge_asof(df, htf_small, on="Datetime", direction="backward")
+            mtf_status = "OK"
+        else:
+            df["trend_up"] = np.nan
+            mtf_status = "NO_HTF_ROWS"
+    except Exception:
         df["trend_up"] = np.nan
-    df["trend_up"] = df["trend_up"].fillna(0.5).astype(float)
+        mtf_status = "MERGE_FAILED"
 else:
-    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
-    df["trend_up"] = 0.5
+    df["trend_up"] = np.nan
+    mtf_status = "OFF"
+
+df["trend_up"] = df["trend_up"].fillna(0.5).astype(float)
 
 df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
 
 FEATURES = ["r1","r3","r5","r10","r20","RSI","ema_diff","vol_ratio","MACD_hist",
             "ADX","Stoch_K","dist_vwap","dist_ema200","bb_pos","hl_range","trend_up"]
 
-with st.expander("🔍 Debug: Data quality check"):
-    nan_counts = df[FEATURES + ["target"]].isna().sum()
-    st.write(f"Total candles fetched: {len(raw)} | Invalid candles dropped in cleaning: {dropped_main}")
-    st.write("NaN count per feature (before dropna):")
-    st.write(nan_counts[nan_counts > 0] if nan_counts.sum() > 0 else "Koi NaN nahi — clean hai.")
+# ---- KEY FIX: fillna instead of dropna for indicator warmup gaps ----
+# Har feature ke shuru ke NaN (indicator warmup) ko safely fill karo, taaki
+# ek bhi column poore rows ko delete na kar sake.
+for f in FEATURES:
+    df[f] = df[f].replace([np.inf, -np.inf], np.nan)
+    df[f] = df[f].bfill().ffill().fillna(0)
 
-data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
+with st.expander("🔍 Debug: Data quality check"):
+    st.write(f"Total candles fetched: {len(raw)} | Invalid candles cleaned: {dropped_main} | MTF status: {mtf_status}")
+    st.write(f"Rows available after feature engineering: {len(df)}")
+
+# Ab sirf target (last row hamesha NaN rahega, expected) ke liye dropna
+data = df.dropna(subset=["target"]).reset_index(drop=True)
 n_samples = len(data)
 
 if n_samples < 50:
-    st.error(f"Sirf {n_samples} valid rows hain indicators/dropna ke baad — itna data ML training ke liye kaafi nahi hai. "
-             f"Timeframe change karo (1h ya 1d try karo) ya candles slider badhao.")
+    st.error(f"Sirf {n_samples} rows hain — itna data ML training ke liye kaafi nahi hai. "
+             f"Candles slider badhao ya timeframe badlo.")
     st.stop()
 
 # ==================== WALK-FORWARD VALIDATION ====================
 max_possible_folds = max(1, (n_samples - 1) // 30)
 n_folds = min(cfg["min_folds_acc"], max_possible_folds)
 n_folds = max(n_folds, 2)
-
-if n_folds < cfg["min_folds_acc"]:
-    st.info(f"Data kam hone ki wajah se {n_folds} folds use ho rahe hain (requested: {cfg['min_folds_acc']}).")
 
 tscv = TimeSeriesSplit(n_splits=n_folds)
 fold_accs = []
@@ -263,7 +278,7 @@ for train_idx, test_idx in tscv.split(data):
     fold_accs.append((m.predict(te[FEATURES]) == te["target"]).mean())
 
 if len(fold_accs) == 0:
-    st.error("Koi valid fold nahi ban paya — candles ya timeframe badlo.")
+    st.error("Model train nahi ho paya — candles ya timeframe badlo.")
     st.stop()
 
 avg_acc = np.mean(fold_accs)
@@ -278,9 +293,7 @@ final_model.fit(data[FEATURES], data["target"])
 gb_est = final_model.estimators_[0]
 importances = pd.Series(gb_est.feature_importances_, index=FEATURES).sort_values(ascending=False)
 
-df["ai_prob"] = np.nan
-valid_idx = df.dropna(subset=FEATURES).index
-df.loc[valid_idx, "ai_prob"] = final_model.predict_proba(df.loc[valid_idx, FEATURES])[:,1]
+df["ai_prob"] = final_model.predict_proba(df[FEATURES])[:,1]
 df["score"] = (df["ai_prob"] * 100).round(0)
 
 latest = df.iloc[-1]
@@ -303,13 +316,13 @@ c4.metric(f"Walk-fwd Acc ({n_folds} folds)", f"{avg_acc*100:.1f}% ±{std_acc*100
 c5.metric("HTF Trend", "UP" if latest["trend_up"]==1 else ("DOWN" if latest["trend_up"]==0 else "NEUTRAL"))
 
 st.caption(f"{'🟢 MARKET OPEN — live candle forming' if is_open else '🔴 MARKET CLOSED'} | "
-           f"SL: {sl:.1f} | Target: {target:.1f} | Candles: {len(df)}")
+           f"SL: {sl:.1f} | Target: {target:.1f} | Candles: {len(df)} | TF: {cfg['timeframe']}")
 
 if avg_acc < 0.55:
     st.warning(f"Walk-forward accuracy {avg_acc*100:.1f}% (±{std_acc*100:.1f}%) hai — abhi consistent edge nahi mila. "
                f"Signal ko reference ke taur pe treat karo, sole basis nahi.")
 
-with st.expander("📊 Feature Importance (AI ne kin cheezon pe dhyan diya)"):
+with st.expander("📊 Feature Importance"):
     st.bar_chart(importances.head(10))
 
 # ==================== PROFESSIONAL CHART ====================
@@ -324,7 +337,6 @@ fig.add_trace(go.Candlestick(
     line=dict(width=1)
 ), row=1, col=1)
 
-# highlight the still-forming (latest) candle when market is open
 if is_open:
     last = df.iloc[-1]
     fig.add_trace(go.Scatter(
@@ -367,8 +379,7 @@ fig.update_layout(
     template="plotly_dark", height=980, xaxis_rangeslider_visible=False,
     dragmode="pan", margin=dict(l=10,r=10,t=30,b=10),
     legend=dict(orientation="h", y=1.03, font=dict(size=10)),
-    uirevision="keep",
-    font=dict(size=11),
+    uirevision="keep", font=dict(size=11),
     plot_bgcolor="#0e1117", paper_bgcolor="#0e1117"
 )
 fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
@@ -380,4 +391,4 @@ fig.update_xaxes(range=[df["Datetime"].iloc[-visible_window], df["Datetime"].ilo
 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
 
 st.caption(f"Last update: {datetime.now(IST).strftime('%d %b %H:%M:%S IST')} | "
-           f"Folds: {n_folds} | Features: {len(FEATURES)} | Data source: Yahoo Finance (delayed) | Paper testing only.")
+           f"Folds: {n_folds} | Data source: Yahoo Finance (delayed) | Paper testing only.")

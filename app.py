@@ -1,5 +1,5 @@
-# app.py — Advanced AI Index Dashboard v2
-# Multi-timeframe confirmation | Ensemble ML | 1000+ candles | Persistent settings
+# app.py — AI Index Dashboard (Final Consolidated Version)
+# Persistent settings | MTF confirmation | Ensemble ML | Data validation | Pro chart
 
 import streamlit as st
 import yfinance as yf
@@ -19,12 +19,12 @@ st.set_page_config(page_title="AI Pro Dashboard", layout="wide", initial_sidebar
 CONFIG_FILE = "settings.json"
 IST = pytz.timezone("Asia/Kolkata")
 
-# ---------------- PERSISTENT SETTINGS ----------------
+# ==================== PERSISTENT SETTINGS ====================
 DEFAULTS = {
-    "index": "NIFTY 50", "timeframe": "15m", "candles": 1000,
+    "index": "NIFTY 50", "timeframe": "1h", "candles": 800,
     "fast_ema": 12, "slow_ema": 26, "buy_score": 78, "sell_score": 22,
     "sl_atr": 1.5, "target_atr": 2.5, "cost_pct": 0.03, "auto_refresh": True,
-    "use_mtf": True, "mtf_interval": "1h", "min_folds_acc": 3
+    "use_mtf": True, "mtf_interval": "1d", "min_folds_acc": 3
 }
 
 def load_settings():
@@ -80,7 +80,10 @@ with st.sidebar:
 
     st.checkbox("Auto refresh (30s live)", cfg["auto_refresh"], key="w_auto_refresh", on_change=upd("auto_refresh"))
 
-# ---------------- MARKET STATUS ----------------
+    if cfg["timeframe"] in ["5m", "15m"] and cfg["candles"] > 600:
+        st.caption("⚠️ Intraday timeframes (5m/15m) ka yfinance history limited hota hai (~60 din). Itne candles na milein toh timeframe 1h/1d karo.")
+
+# ==================== MARKET STATUS ====================
 def market_open():
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -91,25 +94,45 @@ is_open = market_open()
 if cfg["auto_refresh"] and is_open:
     st_autorefresh(interval=30_000, key="refresh")
 
-# ---------------- DATA ----------------
+# ==================== DATA FETCH + VALIDATION ====================
 @st.cache_data(ttl=25)
 def fetch_data(symbol, interval, period):
-    df = yf.download(symbol, interval=interval, period=period, progress=False)
+    try:
+        df = yf.download(symbol, interval=interval, period=period, progress=False)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
     df = df.reset_index()
     df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    return df
+    date_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df = df.rename(columns={date_col: "Datetime"})
+
+    # --- candle quality / validation ---
+    before = len(df)
+    df = df.dropna(subset=["Open","High","Low","Close"])
+    df = df[(df["High"] >= df["Low"]) & (df["High"] >= df["Open"]) &
+            (df["High"] >= df["Close"]) & (df["Low"] <= df["Open"]) &
+            (df["Low"] <= df["Close"]) & (df["Volume"] >= 0)]
+    df = df.drop_duplicates(subset="Datetime").sort_values("Datetime").reset_index(drop=True)
+    dropped = before - len(df)
+    return df, dropped
 
 period_map = {"5m":"60d","15m":"60d","1h":"2y","1d":"5y"}
 symbol = SYMBOL_MAP[cfg["index"]]
-raw = fetch_data(symbol, cfg["timeframe"], period_map[cfg["timeframe"]])
+raw, dropped_main = fetch_data(symbol, cfg["timeframe"], period_map[cfg["timeframe"]])
+
+if raw.empty:
+    st.error("Data fetch fail hua — market band ho sakta hai ya yfinance temporarily unavailable hai. Thodi der baad retry karo.")
+    st.stop()
+
 df = raw.tail(cfg["candles"]).reset_index(drop=True)
 
+htf_raw = pd.DataFrame()
 if cfg["use_mtf"]:
-    htf_raw = fetch_data(symbol, cfg["mtf_interval"], period_map[cfg["mtf_interval"]])
-    htf_raw["EMA_htf"] = htf_raw["Close"].ewm(span=21).mean()
-    htf_raw["trend_up"] = htf_raw["Close"] > htf_raw["EMA_htf"]
+    htf_raw, _ = fetch_data(symbol, cfg["mtf_interval"], period_map[cfg["mtf_interval"]])
 
-# ---------------- FEATURE ENGINEERING ----------------
+# ==================== FEATURE ENGINEERING ====================
 def rsi(series, period=14):
     d = series.diff()
     gain = d.clip(lower=0).rolling(period).mean()
@@ -177,32 +200,39 @@ df["dist_ema200"] = (df["Close"] - df["EMA200"]) / df["Close"]
 df["bb_pos"] = (df["Close"] - df["BB_dn"]) / (df["BB_up"] - df["BB_dn"] + 1e-9)
 df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
 
-# MTF trend merge
-# MTF trend merge
+# ---- MTF trend merge (robust) ----
 if cfg["use_mtf"] and not htf_raw.empty:
     htf = htf_raw.copy()
+    htf["EMA_htf"] = htf["Close"].ewm(span=21).mean()
+    htf["trend_up"] = (htf["Close"] > htf["EMA_htf"]).astype(float)
+
     htf["Datetime"] = pd.to_datetime(htf["Datetime"], utc=True).dt.tz_localize(None)
     df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
 
     df = df.sort_values("Datetime")
-    htf = htf[["Datetime", "trend_up"]].dropna().sort_values("Datetime")
+    htf_small = htf[["Datetime", "trend_up"]].dropna().sort_values("Datetime")
 
-    if len(htf) > 0:
-        df = pd.merge_asof(df, htf, on="Datetime", direction="backward")
+    if len(htf_small) > 0:
+        df = pd.merge_asof(df, htf_small, on="Datetime", direction="backward")
     else:
         df["trend_up"] = np.nan
-
     df["trend_up"] = df["trend_up"].fillna(0.5).astype(float)
 else:
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_localize(None)
     df["trend_up"] = 0.5
 
 df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
 
 FEATURES = ["r1","r3","r5","r10","r20","RSI","ema_diff","vol_ratio","MACD_hist",
             "ADX","Stoch_K","dist_vwap","dist_ema200","bb_pos","hl_range","trend_up"]
-data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
 
-# ---------------- WALK-FORWARD VALIDATION (multiple folds) ----------------
+with st.expander("🔍 Debug: Data quality check"):
+    nan_counts = df[FEATURES + ["target"]].isna().sum()
+    st.write(f"Total candles fetched: {len(raw)} | Invalid candles dropped in cleaning: {dropped_main}")
+    st.write("NaN count per feature (before dropna):")
+    st.write(nan_counts[nan_counts > 0] if nan_counts.sum() > 0 else "Koi NaN nahi — clean hai.")
+
+data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
 n_samples = len(data)
 
 if n_samples < 50:
@@ -210,6 +240,7 @@ if n_samples < 50:
              f"Timeframe change karo (1h ya 1d try karo) ya candles slider badhao.")
     st.stop()
 
+# ==================== WALK-FORWARD VALIDATION ====================
 max_possible_folds = max(1, (n_samples - 1) // 30)
 n_folds = min(cfg["min_folds_acc"], max_possible_folds)
 n_folds = max(n_folds, 2)
@@ -238,14 +269,12 @@ if len(fold_accs) == 0:
 avg_acc = np.mean(fold_accs)
 std_acc = np.std(fold_accs)
 
-# Final model trained on all data for live signal
 final_model = VotingClassifier([
     ("gb", GradientBoostingClassifier(n_estimators=150, max_depth=3, learning_rate=0.05)),
     ("rf", RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42))
 ], voting="soft")
 final_model.fit(data[FEATURES], data["target"])
 
-# feature importance from GB estimator
 gb_est = final_model.estimators_[0]
 importances = pd.Series(gb_est.feature_importances_, index=FEATURES).sort_values(ascending=False)
 
@@ -265,65 +294,90 @@ else:
 sl = latest["Close"] - cfg["sl_atr"]*latest["ATR"] if signal=="BUY" else latest["Close"] + cfg["sl_atr"]*latest["ATR"]
 target = latest["Close"] + cfg["target_atr"]*latest["ATR"] if signal=="BUY" else latest["Close"] - cfg["target_atr"]*latest["ATR"]
 
-# ---------------- HEADER ----------------
+# ==================== HEADER ====================
 c1,c2,c3,c4,c5 = st.columns(5)
 c1.metric(cfg["index"], f"{latest['Close']:.2f}", f"{df['Close'].pct_change().iloc[-1]*100:.2f}%")
 c2.metric("AI Signal", signal)
 c3.metric("Score (0-100)", f"{latest['score']:.0f}")
 c4.metric(f"Walk-fwd Acc ({n_folds} folds)", f"{avg_acc*100:.1f}% ±{std_acc*100:.1f}")
-c5.metric("HTF Trend", "UP" if latest["trend_up"]==1 else "DOWN")
+c5.metric("HTF Trend", "UP" if latest["trend_up"]==1 else ("DOWN" if latest["trend_up"]==0 else "NEUTRAL"))
 
-st.caption(f"{'🟢 MARKET OPEN' if is_open else '🔴 MARKET CLOSED'} | SL: {sl:.1f} | Target: {target:.1f} | "
-           f"Candles: {len(df)} | Model: GB+RF Ensemble")
+st.caption(f"{'🟢 MARKET OPEN — live candle forming' if is_open else '🔴 MARKET CLOSED'} | "
+           f"SL: {sl:.1f} | Target: {target:.1f} | Candles: {len(df)}")
 
 if avg_acc < 0.55:
-    st.warning(f"Walk-forward accuracy {avg_acc*100:.1f}% hai — variance ±{std_acc*100:.1f}% ke saath. "
-               f"Isse pata chalta hai model abhi consistently edge nahi de raha. Feature/timeframe adjust kar ke retest karo.")
+    st.warning(f"Walk-forward accuracy {avg_acc*100:.1f}% (±{std_acc*100:.1f}%) hai — abhi consistent edge nahi mila. "
+               f"Signal ko reference ke taur pe treat karo, sole basis nahi.")
 
 with st.expander("📊 Feature Importance (AI ne kin cheezon pe dhyan diya)"):
     st.bar_chart(importances.head(10))
 
-# ---------------- PROFESSIONAL CHART ----------------
-fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5,0.15,0.15,0.2],
+# ==================== PROFESSIONAL CHART ====================
+fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.55,0.15,0.15,0.15],
                      vertical_spacing=0.02)
 
 fig.add_trace(go.Candlestick(
     x=df["Datetime"], open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-    name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
+    name="Price",
+    increasing_line_color="#00e396", increasing_fillcolor="#00e396",
+    decreasing_line_color="#ff4560", decreasing_fillcolor="#ff4560",
+    line=dict(width=1)
 ), row=1, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_fast"], name=f"EMA{cfg['fast_ema']}", line=dict(color="orange", width=1)), row=1, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_slow"], name=f"EMA{cfg['slow_ema']}", line=dict(color="cyan", width=1)), row=1, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA200"], name="EMA200", line=dict(color="white", width=1, dash="dash")), row=1, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(color="yellow", width=1)), row=1, col=1)
+
+# highlight the still-forming (latest) candle when market is open
+if is_open:
+    last = df.iloc[-1]
+    fig.add_trace(go.Scatter(
+        x=[last["Datetime"]], y=[last["High"]*1.001], mode="markers+text",
+        marker=dict(size=6, color="#ffd700", symbol="diamond"),
+        text=["live"], textposition="top center", textfont=dict(size=10, color="#ffd700"),
+        name="Forming candle", showlegend=False
+    ), row=1, col=1)
+
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_fast"], name=f"EMA{cfg['fast_ema']}", line=dict(color="#ffa726", width=1.2)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA_slow"], name=f"EMA{cfg['slow_ema']}", line=dict(color="#29b6f6", width=1.2)), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["EMA200"], name="EMA200", line=dict(color="#e0e0e0", width=1, dash="dash")), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["VWAP"], name="VWAP", line=dict(color="#fff176", width=1)), row=1, col=1)
 fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_up"], line=dict(color="gray", width=0.5, dash="dot"), name="BB Up"), row=1, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_dn"], line=dict(color="gray", width=0.5, dash="dot"), name="BB Dn"), row=1, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["BB_dn"], line=dict(color="gray", width=0.5, dash="dot"), name="BB Dn",
+              fill="tonexty", fillcolor="rgba(128,128,128,0.05)"), row=1, col=1)
 
 buys = df[df["score"] >= cfg["buy_score"]]
 sells = df[df["score"] <= cfg["sell_score"]]
-fig.add_trace(go.Scatter(x=buys["Datetime"], y=buys["Low"]*0.997, mode="markers",
-              marker=dict(symbol="triangle-up", color="lime", size=11), name="Buy"), row=1, col=1)
-fig.add_trace(go.Scatter(x=sells["Datetime"], y=sells["High"]*1.003, mode="markers",
-              marker=dict(symbol="triangle-down", color="red", size=11), name="Sell"), row=1, col=1)
+fig.add_trace(go.Scatter(x=buys["Datetime"], y=buys["Low"]*0.996, mode="markers",
+              marker=dict(symbol="triangle-up", color="#00e396", size=12, line=dict(width=1, color="white")),
+              name="Buy"), row=1, col=1)
+fig.add_trace(go.Scatter(x=sells["Datetime"], y=sells["High"]*1.004, mode="markers",
+              marker=dict(symbol="triangle-down", color="#ff4560", size=12, line=dict(width=1, color="white")),
+              name="Sell"), row=1, col=1)
 
-fig.add_trace(go.Bar(x=df["Datetime"], y=df["Volume"], name="Volume", marker_color="#555"), row=2, col=1)
+vol_colors = np.where(df["Close"] >= df["Open"], "#00e39680", "#ff456080")
+fig.add_trace(go.Bar(x=df["Datetime"], y=df["Volume"], name="Volume", marker_color=vol_colors), row=2, col=1)
 
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="violet")), row=3, col=1)
-fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
-fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["RSI"], name="RSI", line=dict(color="#ba68c8")), row=3, col=1)
+fig.add_hline(y=70, line_dash="dot", line_color="#ff4560", row=3, col=1)
+fig.add_hline(y=30, line_dash="dot", line_color="#00e396", row=3, col=1)
 
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD"], name="MACD", line=dict(color="cyan")), row=4, col=1)
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD_signal"], name="Signal", line=dict(color="orange")), row=4, col=1)
-fig.add_trace(go.Bar(x=df["Datetime"], y=df["MACD_hist"], name="Histogram", marker_color="gray"), row=4, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD"], name="MACD", line=dict(color="#29b6f6")), row=4, col=1)
+fig.add_trace(go.Scatter(x=df["Datetime"], y=df["MACD_signal"], name="Signal", line=dict(color="#ffa726")), row=4, col=1)
+macd_colors = np.where(df["MACD_hist"] >= 0, "#00e396", "#ff4560")
+fig.add_trace(go.Bar(x=df["Datetime"], y=df["MACD_hist"], name="Histogram", marker_color=macd_colors), row=4, col=1)
 
 fig.update_layout(
-    template="plotly_dark", height=950, xaxis_rangeslider_visible=False,
+    template="plotly_dark", height=980, xaxis_rangeslider_visible=False,
     dragmode="pan", margin=dict(l=10,r=10,t=30,b=10),
-    legend=dict(orientation="h", y=1.03), uirevision="keep"
+    legend=dict(orientation="h", y=1.03, font=dict(size=10)),
+    uirevision="keep",
+    font=dict(size=11),
+    plot_bgcolor="#0e1117", paper_bgcolor="#0e1117"
 )
-# default zoom to last ~150 candles for readability, full history still scrollable
-fig.update_xaxes(range=[df["Datetime"].iloc[-150], df["Datetime"].iloc[-1]], row=1, col=1)
+fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+
+visible_window = min(150, len(df))
+fig.update_xaxes(range=[df["Datetime"].iloc[-visible_window], df["Datetime"].iloc[-1]], row=1, col=1)
 
 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
 
 st.caption(f"Last update: {datetime.now(IST).strftime('%d %b %H:%M:%S IST')} | "
-           f"Folds: {n_folds} | Features: {len(FEATURES)} | Paper testing only.")
+           f"Folds: {n_folds} | Features: {len(FEATURES)} | Data source: Yahoo Finance (delayed) | Paper testing only.")
